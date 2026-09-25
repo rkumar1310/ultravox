@@ -1,5 +1,6 @@
 .vscode/
 .venv/
+.model-cache/
 .hermit/
 runs/
 outputs/
@@ -190,4 +191,3 @@ cython_debug/
 mds_output/
 mlruns/
 output/
-
