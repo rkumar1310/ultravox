@@ -34,6 +34,7 @@ image = (
         "jiwer==3.1.0",
         "peft==0.11.1",
         "safetensors==0.5.3",
+        "scipy==1.14.1",
         "soundfile==0.13.1",
         "transformers==4.49.0",
     )
@@ -63,6 +64,8 @@ volumes = {CACHE_PATH: cache_volume}
 @app.function(image=image, volumes=volumes, timeout=30 * MINUTES)
 def prepare_assets() -> dict[str, str]:
     import shutil
+    import urllib.request
+    import zipfile
 
     from huggingface_hub import snapshot_download
 
@@ -130,6 +133,20 @@ def prepare_assets() -> dict[str, str]:
             pathlib.Path(validation_snapshot) / "clean/validation/0000.parquet",
             validation_target,
         )
+    augmentation_root = CACHE_PATH / "rirs-noises"
+    extracted_root = augmentation_root / "RIRS_NOISES"
+    if not extracted_root.exists():
+        augmentation_root.mkdir(parents=True, exist_ok=True)
+        archive = augmentation_root / "rirs_noises.zip"
+        if not archive.exists():
+            urllib.request.urlretrieve(
+                "https://www.openslr.org/resources/28/rirs_noises.zip",
+                archive,
+            )
+        with zipfile.ZipFile(archive) as source:
+            source.extractall(augmentation_root)
+        archive.unlink(missing_ok=True)
+    augmentation_wavs = list(extracted_root.rglob("*.wav"))
     cache_volume.commit()
     return {
         "ultravoxWeights": str(ultravox_path / "model.safetensors"),
@@ -138,6 +155,8 @@ def prepare_assets() -> dict[str, str]:
         "trainSecondParquet": str(train_second_target),
         "trainShardCount": str(len(train_shards)),
         "validationParquet": str(validation_target),
+        "augmentationAssets": str(extracted_root),
+        "augmentationWavCount": str(len(augmentation_wavs)),
     }
 
 
@@ -145,7 +164,7 @@ def prepare_assets() -> dict[str, str]:
     image=image,
     gpu="T4",
     volumes=volumes,
-    timeout=30 * MINUTES,
+    timeout=6 * 60 * MINUTES,
 )
 def train_block(
     block_start: int = 0,
@@ -156,6 +175,7 @@ def train_block(
     encode_batch_size: int = 8,
     training_microbatch_size: int = 1,
     checkpoint_every_samples: int = 0,
+    robust_augmentation: bool = False,
 ) -> dict[str, object]:
     import os
     import shutil
@@ -193,11 +213,20 @@ def train_block(
     training_target.symlink_to(training_cache, target_is_directory=True)
 
     block_end = block_start + block_size
-    checkpoint = training_cache / "adapter-asr.pt"
-    checkpoint_dir = training_cache / "checkpoints"
+    checkpoint = training_cache / (
+        "adapter-asr-robust-latest.pt" if robust_augmentation else "adapter-asr.pt"
+    )
+    checkpoint_dir = training_cache / (
+        "robust-checkpoints" if robust_augmentation else "checkpoints"
+    )
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    if block_start:
-        start_checkpoint = checkpoint_dir / f"adapter-{block_start:04d}.pt"
+    start_checkpoint = training_cache / "checkpoints" / f"adapter-{block_start:04d}.pt"
+    if robust_augmentation:
+        if not start_checkpoint.exists():
+            raise FileNotFoundError(
+                f"No clean checkpoint available for robust run: {start_checkpoint}"
+            )
+    elif block_start:
         if start_checkpoint.exists():
             shutil.copy2(start_checkpoint, checkpoint)
         elif checkpoint.exists():
@@ -212,9 +241,9 @@ def train_block(
         "-m",
         "scripts.train_shared_whisper_adapter_librispeech",
         "--train-samples",
-        str(block_end),
+        str(block_size if robust_augmentation else block_end),
         "--train-start-index",
-        str(block_start),
+        str(0 if robust_augmentation else block_start),
         "--validation-samples",
         str(validation_samples),
         "--encode-batch-size",
@@ -230,6 +259,17 @@ def train_block(
         "--validation-decode-samples",
         str(min(validation_samples, validation_decode_samples)),
     ]
+    if robust_augmentation:
+        command.extend(
+            [
+                "--checkpoint-offset",
+                str(block_start),
+                "--resume-checkpoint",
+                str(start_checkpoint),
+                "--augmentation-assets-dir",
+                str(CACHE_PATH / "rirs-noises" / "RIRS_NOISES"),
+            ]
+        )
     if checkpoint_every_samples:
         command.extend(
             ["--checkpoint-every-samples", str(checkpoint_every_samples)]
@@ -283,6 +323,7 @@ def train_block(
             checkpoint_results.append(
                 json.loads(stripped.removeprefix("checkpoint_result="))
             )
+            cache_volume.commit()
         if stripped.startswith("features=train"):
             stage["value"] = "encoder_train"
         elif stripped.startswith("features=validation"):
@@ -300,7 +341,9 @@ def train_block(
     monitor.join(timeout=2)
     if return_code:
         raise RuntimeError(f"Training process failed with exit code {return_code}")
-    shutil.copy2(checkpoint, checkpoint_dir / f"adapter-{block_end:04d}.pt")
+    final_checkpoint = checkpoint_dir / f"adapter-{block_end:04d}.pt"
+    if not final_checkpoint.exists():
+        shutil.copy2(checkpoint, final_checkpoint)
 
     def summarize(samples: list[tuple[float, float]]) -> dict[str, float]:
         utilization = [sample[0] for sample in samples]
@@ -326,6 +369,7 @@ def train_block(
         "encodeBatchSize": encode_batch_size,
         "trainingMicrobatchSize": training_microbatch_size,
         "checkpointEverySamples": checkpoint_every_samples,
+        "robustAugmentation": robust_augmentation,
         "checkpointResults": checkpoint_results,
         "elapsedSeconds": round(time.monotonic() - started, 1),
         "telemetry": {
@@ -336,7 +380,10 @@ def train_block(
     result_path = (
         CACHE_PATH
         / "shared-whisper-adapter-librispeech"
-        / f"t4-block-{block_start:04d}-{block_end:04d}-mb{training_microbatch_size}.json"
+        / (
+            f"t4-{'robust-' if robust_augmentation else ''}block-"
+            f"{block_start:04d}-{block_end:04d}-mb{training_microbatch_size}.json"
+        )
     )
     result_path.parent.mkdir(parents=True, exist_ok=True)
     result_path.write_text(json.dumps(result, indent=2))
@@ -355,6 +402,7 @@ def main(
     encode_batch_size: int = 8,
     training_microbatch_size: int = 1,
     checkpoint_every_samples: int = 0,
+    robust_augmentation: bool = False,
 ) -> None:
     print(json.dumps(prepare_assets.remote(), indent=2))
     final_sample = end_samples or block_start + block_size
@@ -369,6 +417,7 @@ def main(
             encode_batch_size=encode_batch_size,
             training_microbatch_size=training_microbatch_size,
             checkpoint_every_samples=checkpoint_every_samples,
+            robust_augmentation=robust_augmentation,
         )
         print(json.dumps(result, indent=2))
         block_start += current_size

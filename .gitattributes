@@ -1,1 +1,2 @@
 *.json filter=lfs diff=lfs merge=lfs -text
+checkpoints/shared-whisper-adapter/*.pt filter=lfs diff=lfs merge=lfs -text

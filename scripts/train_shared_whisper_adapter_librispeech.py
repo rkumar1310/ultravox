@@ -13,6 +13,7 @@ import io
 import json
 import pathlib
 import re
+import shutil
 import time
 from dataclasses import dataclass
 
@@ -24,6 +25,8 @@ from datasets import load_dataset
 from jiwer import wer
 from torch.nn.utils.rnn import pad_sequence
 
+from scripts.audio_augmentation import PROFILE_NAME
+from scripts.audio_augmentation import RobustAudioAugmenter
 from scripts.dual_output_probe import _decode_whisper_official
 from scripts.dual_output_probe import _load_whisper_decoder_model
 from scripts.train_shared_whisper_adapter import HOLDOUT_AUDIO
@@ -64,6 +67,12 @@ def main() -> None:
     parser.add_argument("--encode-batch-size", type=int, default=4)
     parser.add_argument("--training-microbatch-size", type=int, default=1)
     parser.add_argument("--train-start-index", type=int, default=0)
+    parser.add_argument(
+        "--checkpoint-offset",
+        type=int,
+        default=0,
+        help="Add this offset to checkpoint sample numbers.",
+    )
     parser.add_argument("--max-duration-seconds", type=float, default=29.5)
     parser.add_argument(
         "--local-dataset-dir",
@@ -82,6 +91,16 @@ def main() -> None:
     parser.add_argument("--rebuild-features", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
+        "--resume-checkpoint",
+        type=pathlib.Path,
+        help="Explicit adapter checkpoint to load before training.",
+    )
+    parser.add_argument(
+        "--augmentation-assets-dir",
+        type=pathlib.Path,
+        help="Enable deterministic mild noise, room, and speech-overlap augmentation.",
+    )
+    parser.add_argument(
         "--no-synthetic-bootstrap",
         action="store_true",
         help="Start from random adapter weights rather than the prior synthetic checkpoint.",
@@ -96,6 +115,10 @@ def main() -> None:
         parser.error("checkpoint-every-samples cannot be negative")
     if args.checkpoint_every_samples and args.epochs != 1:
         parser.error("checkpoint-every-samples currently requires exactly one epoch")
+    if args.checkpoint_offset < 0:
+        parser.error("checkpoint-offset cannot be negative")
+    if args.resume_checkpoint is not None and not args.resume_checkpoint.exists():
+        parser.error(f"resume checkpoint does not exist: {args.resume_checkpoint}")
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -110,12 +133,32 @@ def main() -> None:
     processor = transformers.AutoProcessor.from_pretrained(MODEL_ID)
     WORK_DIR.mkdir(parents=True, exist_ok=True)
 
+    training_augmenter = None
+    robust_validation_augmenter = None
+    if args.augmentation_assets_dir is not None:
+        training_augmenter = RobustAudioAugmenter(
+            args.augmentation_assets_dir, seed=args.seed
+        )
+        robust_validation_augmenter = RobustAudioAugmenter(
+            args.augmentation_assets_dir, seed=args.seed + 10_000
+        )
+        print(
+            "augmentation="
+            + json.dumps(
+                {
+                    "profile": PROFILE_NAME,
+                    **training_augmenter.asset_counts,
+                }
+            ),
+            flush=True,
+        )
+
     train_records = _prepare_split(
         processor=processor,
         device=device,
         dtype=dtype,
         dataset_split="train.100",
-        output_split="train",
+        output_split=(f"train-{PROFILE_NAME}" if training_augmenter else "train"),
         sample_count=args.train_samples,
         seed=args.seed,
         shuffle_buffer=args.shuffle_buffer,
@@ -123,6 +166,7 @@ def main() -> None:
         max_duration_seconds=args.max_duration_seconds,
         rebuild=args.rebuild_features,
         local_dataset_dir=args.local_dataset_dir,
+        augmenter=training_augmenter,
     )
     validation_records = _prepare_split(
         processor=processor,
@@ -137,7 +181,25 @@ def main() -> None:
         max_duration_seconds=args.max_duration_seconds,
         rebuild=args.rebuild_features,
         local_dataset_dir=args.local_dataset_dir,
+        augmenter=None,
     )
+    robust_validation_records: list[FeatureRecord] = []
+    if robust_validation_augmenter is not None:
+        robust_validation_records = _prepare_split(
+            processor=processor,
+            device=device,
+            dtype=dtype,
+            dataset_split="validation",
+            output_split=f"validation-{PROFILE_NAME}",
+            sample_count=args.validation_samples,
+            seed=args.seed + 10_000,
+            shuffle_buffer=0,
+            encode_batch_size=args.encode_batch_size,
+            max_duration_seconds=args.max_duration_seconds,
+            rebuild=args.rebuild_features,
+            local_dataset_dir=args.local_dataset_dir,
+            augmenter=robust_validation_augmenter,
+        )
     print(
         json.dumps(
             {
@@ -146,9 +208,18 @@ def main() -> None:
                 "authenticationRequired": False,
                 "trainSamples": len(train_records),
                 "validationSamples": len(validation_records),
+                "robustValidationSamples": len(robust_validation_records),
                 "trainHours": round(
                     sum(record.duration_seconds for record in train_records) / 3600,
                     3,
+                ),
+                "augmentationStats": (
+                    training_augmenter.stats if training_augmenter else None
+                ),
+                "robustValidationAugmentationStats": (
+                    robust_validation_augmenter.stats
+                    if robust_validation_augmenter
+                    else None
                 ),
                 "validationHours": round(
                     sum(record.duration_seconds for record in validation_records)
@@ -164,13 +235,34 @@ def main() -> None:
         return
 
     training_records = train_records[args.train_start_index :]
+    robust_run = args.augmentation_assets_dir is not None
+    run_checkpoint = (
+        WORK_DIR / "adapter-asr-robust-latest.pt" if robust_run else CHECKPOINT
+    )
+    checkpoint_dir = WORK_DIR / (
+        "robust-checkpoints" if robust_run else "checkpoints"
+    )
+    best_checkpoint = (
+        WORK_DIR / "adapter-asr-robust-best.pt" if robust_run else run_checkpoint
+    )
+    results_path = (
+        WORK_DIR / "robust-10000-20000-results.jsonl" if robust_run else None
+    )
+    if results_path is not None:
+        results_path.unlink(missing_ok=True)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     adapter = ShortStateAdapter().to(device=device, dtype=torch.float32)
-    if args.resume and CHECKPOINT.exists():
+    if args.resume_checkpoint is not None:
         adapter.load_state_dict(
-            torch.load(CHECKPOINT, map_location=device, weights_only=True)
+            torch.load(args.resume_checkpoint, map_location=device, weights_only=True)
         )
-        print(f"resumed={CHECKPOINT}", flush=True)
+        print(f"resumed={args.resume_checkpoint}", flush=True)
+    elif args.resume and run_checkpoint.exists():
+        adapter.load_state_dict(
+            torch.load(run_checkpoint, map_location=device, weights_only=True)
+        )
+        print(f"resumed={run_checkpoint}", flush=True)
     elif not args.no_synthetic_bootstrap and SYNTHETIC_BOOTSTRAP.exists():
         adapter.load_state_dict(
             torch.load(SYNTHETIC_BOOTSTRAP, map_location=device, weights_only=True)
@@ -182,10 +274,31 @@ def main() -> None:
         parameter.requires_grad_(False)
     optimizer = torch.optim.AdamW(adapter.parameters(), lr=args.learning_rate)
 
-    checkpoint_dir = WORK_DIR / "checkpoints"
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_results: list[dict[str, object]] = []
     best_validation_loss = float("inf")
+    best_validation_wer = float("inf")
+    best_trained_samples = args.checkpoint_offset + args.train_start_index
+    if robust_run:
+        baseline_result = _evaluate_checkpoint(
+            trained_samples=best_trained_samples,
+            checkpoint_path=args.resume_checkpoint or run_checkpoint,
+            train_loss=None,
+            adapter=adapter,
+            decoder=decoder,
+            processor=processor,
+            clean_records=validation_records,
+            robust_records=robust_validation_records,
+            validation_loss_samples=args.validation_loss_samples,
+            validation_decode_samples=args.validation_decode_samples,
+            device=device,
+            dtype=dtype,
+        )
+        checkpoint_results.append(baseline_result)
+        best_validation_loss = float(baseline_result["validationCe"])
+        best_validation_wer = float(baseline_result["validationWer"])
+        torch.save(adapter.state_dict(), best_checkpoint)
+        _append_jsonl(results_path, baseline_result)
+        print("checkpoint_result=" + json.dumps(baseline_result), flush=True)
     for epoch in range(1, args.epochs + 1):
         checkpoint_span = args.checkpoint_every_samples or len(training_records)
         epoch_started = time.monotonic()
@@ -221,7 +334,10 @@ def main() -> None:
                     tensors = tuple(tensor.pin_memory() for tensor in tensors)
                 prepared_batches.append((len(records), tensors))
             absolute_end = (
-                args.train_start_index + chunk_offset + len(chunk_records)
+                args.checkpoint_offset
+                + args.train_start_index
+                + chunk_offset
+                + len(chunk_records)
             )
             print(
                 f"stage=adapter_training_start epoch={epoch} "
@@ -270,20 +386,36 @@ def main() -> None:
                 f"checkpoint={absolute_end}",
                 flush=True,
             )
-            validation_loss = _validation_loss(
-                adapter=adapter,
-                decoder=decoder,
-                processor=processor,
-                records=validation_records[: args.validation_loss_samples],
-                device=device,
-                dtype=dtype,
-            )
-            best_validation_loss = min(best_validation_loss, validation_loss)
-            torch.save(adapter.state_dict(), CHECKPOINT)
+            torch.save(adapter.state_dict(), run_checkpoint)
             milestone_checkpoint = (
                 checkpoint_dir / f"adapter-{absolute_end:04d}.pt"
             )
             torch.save(adapter.state_dict(), milestone_checkpoint)
+            print(
+                f"stage=validation_decode_start checkpoint={absolute_end}",
+                flush=True,
+            )
+            checkpoint_result = _evaluate_checkpoint(
+                trained_samples=absolute_end,
+                checkpoint_path=milestone_checkpoint,
+                train_loss=train_loss,
+                adapter=adapter,
+                decoder=decoder,
+                processor=processor,
+                clean_records=validation_records,
+                robust_records=robust_validation_records,
+                validation_loss_samples=args.validation_loss_samples,
+                validation_decode_samples=args.validation_decode_samples,
+                device=device,
+                dtype=dtype,
+            )
+            validation_loss = float(checkpoint_result["validationCe"])
+            checkpoint_wer = float(checkpoint_result["validationWer"])
+            best_validation_loss = min(best_validation_loss, validation_loss)
+            if checkpoint_wer < best_validation_wer:
+                best_validation_wer = checkpoint_wer
+                best_trained_samples = absolute_end
+                shutil.copy2(milestone_checkpoint, best_checkpoint)
             print(
                 f"epoch={epoch} checkpoint={absolute_end} "
                 f"train_ce={train_loss:.5f} "
@@ -295,32 +427,9 @@ def main() -> None:
                 f"checkpoint={absolute_end}",
                 flush=True,
             )
-            print(
-                f"stage=validation_decode_start checkpoint={absolute_end}",
-                flush=True,
-            )
-            decoded = _decode_validation(
-                adapter=adapter,
-                decoder=decoder,
-                processor=processor,
-                records=validation_records[: args.validation_decode_samples],
-                device=device,
-                dtype=dtype,
-            )
-            checkpoint_wer = wer(
-                [_normalize_for_wer(item["reference"]) for item in decoded],
-                [_normalize_for_wer(item["hypothesis"]) for item in decoded],
-            )
-            checkpoint_result: dict[str, object] = {
-                "trainedSamples": absolute_end,
-                "checkpoint": str(milestone_checkpoint),
-                "trainCe": train_loss,
-                "validationCe": validation_loss,
-                "validationWer": checkpoint_wer,
-                "decodedValidationSamples": len(decoded),
-                "examples": decoded[:5],
-            }
             checkpoint_results.append(checkpoint_result)
+            if results_path is not None:
+                _append_jsonl(results_path, checkpoint_result)
             print(
                 "checkpoint_result=" + json.dumps(checkpoint_result),
                 flush=True,
@@ -333,9 +442,14 @@ def main() -> None:
 
     final_checkpoint = checkpoint_results[-1]
     result: dict[str, object] = {
-        "checkpoint": str(CHECKPOINT),
+        "checkpoint": str(run_checkpoint),
+        "bestCheckpoint": str(best_checkpoint),
+        "bestCheckpointSamples": best_trained_samples,
+        "bestValidationWer": best_validation_wer,
+        "checkpointResultsPath": str(results_path) if results_path else None,
         "trainStartIndex": args.train_start_index,
         "trainEndIndex": args.train_samples,
+        "checkpointOffset": args.checkpoint_offset,
         "trainingMicrobatchSize": args.training_microbatch_size,
         "bestValidationCe": best_validation_loss,
         "decodedValidationSamples": final_checkpoint["decodedValidationSamples"],
@@ -348,6 +462,79 @@ def main() -> None:
             adapter, decoder, processor, device, dtype
         )
     print(json.dumps(result, indent=2), flush=True)
+
+
+def _evaluate_checkpoint(
+    *,
+    trained_samples: int,
+    checkpoint_path: pathlib.Path,
+    train_loss: float | None,
+    adapter: ShortStateAdapter,
+    decoder,
+    processor,
+    clean_records: list[FeatureRecord],
+    robust_records: list[FeatureRecord],
+    validation_loss_samples: int,
+    validation_decode_samples: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> dict[str, object]:
+    validation_loss = _validation_loss(
+        adapter=adapter,
+        decoder=decoder,
+        processor=processor,
+        records=clean_records[:validation_loss_samples],
+        device=device,
+        dtype=dtype,
+    )
+    clean_decoded = _decode_validation(
+        adapter=adapter,
+        decoder=decoder,
+        processor=processor,
+        records=clean_records[:validation_decode_samples],
+        device=device,
+        dtype=dtype,
+    )
+    robust_decoded = _decode_validation(
+        adapter=adapter,
+        decoder=decoder,
+        processor=processor,
+        records=robust_records[:validation_decode_samples],
+        device=device,
+        dtype=dtype,
+    )
+    clean_wer = _decoded_wer(clean_decoded)
+    robust_wer = _decoded_wer(robust_decoded) if robust_decoded else clean_wer
+    combined = [*clean_decoded, *robust_decoded]
+    return {
+        "trainedSamples": trained_samples,
+        "checkpoint": str(checkpoint_path),
+        "trainCe": train_loss,
+        "validationCe": validation_loss,
+        "validationWer": _decoded_wer(combined),
+        "cleanValidationWer": clean_wer,
+        "robustValidationWer": robust_wer,
+        "decodedValidationSamples": len(combined),
+        "cleanExamples": clean_decoded[:3],
+        "robustExamples": robust_decoded[:3],
+        "examples": combined[:5],
+    }
+
+
+def _decoded_wer(decoded: list[dict[str, str]]) -> float:
+    if not decoded:
+        raise ValueError("cannot compute WER for an empty validation set")
+    return wer(
+        [_normalize_for_wer(item["reference"]) for item in decoded],
+        [_normalize_for_wer(item["hypothesis"]) for item in decoded],
+    )
+
+
+def _append_jsonl(path: pathlib.Path, item: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as destination:
+        destination.write(json.dumps(item) + "\n")
+        destination.flush()
 
 
 def _prepare_split(
@@ -364,6 +551,7 @@ def _prepare_split(
     max_duration_seconds: float,
     rebuild: bool,
     local_dataset_dir: pathlib.Path | None,
+    augmenter: RobustAudioAugmenter | None,
 ) -> list[FeatureRecord]:
     output_dir = FEATURE_DIR / output_split
     manifest_path = FEATURE_DIR / f"{output_split}.jsonl"
@@ -446,6 +634,8 @@ def _prepare_split(
             cached = existing[index]
             if cached.sample_id == sample_id and cached.path.exists():
                 records.append(cached)
+                if augmenter is not None:
+                    augmenter.observe(sample_id, audio)
                 continue
         if feature_path.exists():
             records.append(
@@ -457,11 +647,17 @@ def _prepare_split(
                     path=feature_path,
                 )
             )
+            if augmenter is not None:
+                augmenter.observe(sample_id, audio)
             if len(records) - last_manifest_count >= 32:
                 _write_manifest(manifest_path, records)
                 last_manifest_count = len(records)
             _report_feature_progress(output_split, len(records), sample_count, started)
             continue
+        clean_audio = audio
+        if augmenter is not None:
+            audio = augmenter.augment(sample_id, clean_audio).samples
+            augmenter.observe(sample_id, clean_audio)
         pending.append(
             (
                 sample_id,
