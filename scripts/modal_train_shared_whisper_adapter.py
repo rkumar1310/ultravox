@@ -176,6 +176,8 @@ def train_block(
     training_microbatch_size: int = 1,
     checkpoint_every_samples: int = 0,
     robust_augmentation: bool = False,
+    noise_curriculum: bool = False,
+    dataset_start_index: int = 0,
 ) -> dict[str, object]:
     import os
     import shutil
@@ -213,14 +215,31 @@ def train_block(
     training_target.symlink_to(training_cache, target_is_directory=True)
 
     block_end = block_start + block_size
-    checkpoint = training_cache / (
-        "adapter-asr-robust-latest.pt" if robust_augmentation else "adapter-asr.pt"
-    )
-    checkpoint_dir = training_cache / (
-        "robust-checkpoints" if robust_augmentation else "checkpoints"
-    )
+    if noise_curriculum:
+        checkpoint = training_cache / "adapter-asr-noise-latest.pt"
+        checkpoint_dir = training_cache / "noise-checkpoints"
+    elif robust_augmentation:
+        checkpoint = training_cache / "adapter-asr-robust-latest.pt"
+        checkpoint_dir = training_cache / "robust-checkpoints"
+    else:
+        checkpoint = training_cache / "adapter-asr.pt"
+        checkpoint_dir = training_cache / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    start_checkpoint = training_cache / "checkpoints" / f"adapter-{block_start:04d}.pt"
+    if noise_curriculum:
+        if block_start == 20_000:
+            start_checkpoint = (
+                training_cache / "robust-checkpoints" / "adapter-20000.pt"
+            )
+        else:
+            start_checkpoint = checkpoint_dir / f"adapter-{block_start:05d}.pt"
+        if not start_checkpoint.exists():
+            raise FileNotFoundError(
+                f"No prior checkpoint available for noise run: {start_checkpoint}"
+            )
+    else:
+        start_checkpoint = (
+            training_cache / "checkpoints" / f"adapter-{block_start:04d}.pt"
+        )
     if robust_augmentation:
         if not start_checkpoint.exists():
             raise FileNotFoundError(
@@ -241,9 +260,9 @@ def train_block(
         "-m",
         "scripts.train_shared_whisper_adapter_librispeech",
         "--train-samples",
-        str(block_size if robust_augmentation else block_end),
+        str(block_size if robust_augmentation or noise_curriculum else block_end),
         "--train-start-index",
-        str(0 if robust_augmentation else block_start),
+        str(0 if robust_augmentation or noise_curriculum else block_start),
         "--validation-samples",
         str(validation_samples),
         "--encode-batch-size",
@@ -259,21 +278,33 @@ def train_block(
         "--validation-decode-samples",
         str(min(validation_samples, validation_decode_samples)),
     ]
-    if robust_augmentation:
+    if robust_augmentation or noise_curriculum:
         command.extend(
             [
                 "--checkpoint-offset",
                 str(block_start),
                 "--resume-checkpoint",
                 str(start_checkpoint),
-                "--augmentation-assets-dir",
-                str(CACHE_PATH / "rirs-noises" / "RIRS_NOISES"),
             ]
         )
+        if robust_augmentation:
+            command.extend(
+                [
+                    "--augmentation-assets-dir",
+                    str(CACHE_PATH / "rirs-noises" / "RIRS_NOISES"),
+                ]
+            )
+        else:
+            command.extend(
+                [
+                    "--noise-curriculum-assets-dir",
+                    str(CACHE_PATH / "rirs-noises" / "RIRS_NOISES"),
+                    "--dataset-start-index",
+                    str(dataset_start_index),
+                ]
+            )
     if checkpoint_every_samples:
-        command.extend(
-            ["--checkpoint-every-samples", str(checkpoint_every_samples)]
-        )
+        command.extend(["--checkpoint-every-samples", str(checkpoint_every_samples)])
     if block_start:
         command.append("--resume")
     stage = {"value": "startup"}
@@ -370,6 +401,8 @@ def train_block(
         "trainingMicrobatchSize": training_microbatch_size,
         "checkpointEverySamples": checkpoint_every_samples,
         "robustAugmentation": robust_augmentation,
+        "noiseCurriculum": noise_curriculum,
+        "datasetStartIndex": dataset_start_index,
         "checkpointResults": checkpoint_results,
         "elapsedSeconds": round(time.monotonic() - started, 1),
         "telemetry": {
@@ -381,11 +414,301 @@ def train_block(
         CACHE_PATH
         / "shared-whisper-adapter-librispeech"
         / (
-            f"t4-{'robust-' if robust_augmentation else ''}block-"
+            f"t4-{'noise-' if noise_curriculum else ('robust-' if robust_augmentation else '')}block-"
             f"{block_start:04d}-{block_end:04d}-mb{training_microbatch_size}.json"
         )
     )
     result_path.parent.mkdir(parents=True, exist_ok=True)
+    result_path.write_text(json.dumps(result, indent=2))
+    cache_volume.commit()
+    return result
+
+
+@app.function(
+    image=image,
+    gpu="T4",
+    volumes=volumes,
+    timeout=6 * 60 * MINUTES,
+)
+def train_speech_gate_and_joint(
+    head_train_samples: int = 10_000,
+    joint_train_samples: int = 10_000,
+    checkpoint_every_samples: int = 1_000,
+    head_batch_size: int = 50,
+    joint_batch_size: int = 4,
+    encode_batch_size: int = 8,
+) -> dict[str, object]:
+    import os
+    import shutil
+    import statistics
+    import subprocess
+    import threading
+    import time
+
+    model_cache = pathlib.Path("/root/.model-cache")
+    model_cache.mkdir(parents=True, exist_ok=True)
+    for relative in ("ultravox-v05", "shared-whisper-adapter-librispeech"):
+        target = model_cache / relative
+        source = CACHE_PATH / relative
+        if target.exists() or target.is_symlink():
+            if target.is_symlink():
+                target.unlink()
+            elif target.resolve() != source.resolve():
+                shutil.rmtree(target)
+        if not target.exists():
+            target.symlink_to(source, target_is_directory=True)
+
+    bootstrap_target = model_cache / "shared-whisper-adapter" / "adapter.pt"
+    bootstrap_target.parent.mkdir(parents=True, exist_ok=True)
+    if not bootstrap_target.exists():
+        bootstrap_target.symlink_to(
+            CACHE_PATH / "shared-whisper-adapter" / "adapter.pt"
+        )
+
+    stage = {"value": "feature_preparation"}
+    telemetry: dict[str, list[tuple[float, float]]] = {}
+    stop_monitor = threading.Event()
+
+    def monitor_gpu() -> None:
+        while not stop_monitor.wait(0.1):
+            completed = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=utilization.gpu,memory.used",
+                    "--format=csv,noheader,nounits",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            match = re.match(r"\s*([0-9.]+)\s*,\s*([0-9.]+)", completed.stdout.strip())
+            if completed.returncode == 0 and match:
+                telemetry.setdefault(stage["value"], []).append(
+                    (float(match.group(1)), float(match.group(2)))
+                )
+
+    monitor = threading.Thread(target=monitor_gpu, daemon=True)
+    monitor.start()
+    started = time.monotonic()
+    output: list[str] = []
+    checkpoint_results: list[dict[str, object]] = []
+
+    def run(command: list[str]) -> None:
+        process = subprocess.Popen(
+            command,
+            cwd="/root",
+            env={**os.environ},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        assert process.stdout is not None
+        for line in process.stdout:
+            stripped = line.rstrip()
+            print(stripped, flush=True)
+            output.append(stripped)
+            if stripped == "stage=head_training_start":
+                stage["value"] = "head_training"
+            elif stripped == "stage=joint_training_start":
+                stage["value"] = "joint_training"
+            elif stripped.startswith("loading Whisper"):
+                stage["value"] = "decoder_load"
+            elif stripped.startswith("checkpoint_result="):
+                checkpoint_results.append(
+                    json.loads(stripped.removeprefix("checkpoint_result="))
+                )
+                cache_volume.commit()
+        return_code = process.wait()
+        if return_code:
+            raise RuntimeError(
+                f"Training subprocess failed with exit code {return_code}"
+            )
+
+    def read_manifest(path: pathlib.Path) -> list[dict[str, object]]:
+        if not path.exists():
+            return []
+        return [json.loads(line) for line in path.read_text().splitlines() if line]
+
+    def write_joint_manifest(
+        tail_path: pathlib.Path,
+        fill_path: pathlib.Path,
+        head_path: pathlib.Path,
+        output_path: pathlib.Path,
+        count: int,
+    ) -> None:
+        head_ids = {str(row["sampleId"]) for row in read_manifest(head_path)}
+        selected: list[dict[str, object]] = []
+        selected_ids: set[str] = set()
+        for path in (tail_path, fill_path):
+            for row in read_manifest(path):
+                sample_id = str(row["sampleId"])
+                if sample_id in head_ids or sample_id in selected_ids:
+                    continue
+                selected.append(row)
+                selected_ids.add(sample_id)
+                if len(selected) == count:
+                    break
+            if len(selected) == count:
+                break
+        if len(selected) != count:
+            raise RuntimeError(
+                f"Only found {len(selected)} distinct phase-two records; "
+                f"expected {count}"
+            )
+        missing: list[str] = []
+        for row in selected:
+            feature_path = pathlib.Path(str(row["path"]))
+            if not feature_path.is_absolute():
+                feature_path = pathlib.Path("/root") / feature_path
+            if not feature_path.exists():
+                missing.append(str(feature_path))
+        if missing:
+            raise FileNotFoundError(f"Missing phase-two feature state: {missing[0]}")
+        temporary = output_path.with_suffix(".jsonl.tmp")
+        temporary.write_text("".join(json.dumps(row) + "\n" for row in selected))
+        temporary.replace(output_path)
+        print(
+            f"features={output_path.stem} merged={len(selected)}/{count} "
+            f"tail={len(read_manifest(tail_path))} fill={len(read_manifest(fill_path))}",
+            flush=True,
+        )
+
+    try:
+        features = CACHE_PATH / "shared-whisper-adapter-librispeech" / "features"
+        tail_manifest = features / "train-noise-v2-20000.jsonl"
+        fill_manifest = features / "train-noise-v2-00000.jsonl"
+        head_manifest = features / "train-noise-v2-10000.jsonl"
+        joint_manifest = features / "train-noise-v2-joint-10000.jsonl"
+        if len(read_manifest(joint_manifest)) < joint_train_samples:
+            run(
+                [
+                    "python3",
+                    "-m",
+                    "scripts.train_shared_whisper_adapter_librispeech",
+                    "--train-samples",
+                    str(joint_train_samples),
+                    "--dataset-start-index",
+                    "20000",
+                    "--validation-samples",
+                    "50",
+                    "--encode-batch-size",
+                    str(encode_batch_size),
+                    "--local-dataset-dir",
+                    str(CACHE_PATH / "librispeech"),
+                    "--noise-curriculum-assets-dir",
+                    str(CACHE_PATH / "rirs-noises" / "RIRS_NOISES"),
+                    "--prepare-only",
+                    "--allow-partial-prepare",
+                ]
+            )
+            tail_count = len(read_manifest(tail_manifest))
+            fill_count = max(0, joint_train_samples - tail_count)
+            if fill_count:
+                run(
+                    [
+                        "python3",
+                        "-m",
+                        "scripts.train_shared_whisper_adapter_librispeech",
+                        "--train-samples",
+                        str(fill_count),
+                        "--dataset-start-index",
+                        "0",
+                        "--validation-samples",
+                        "50",
+                        "--encode-batch-size",
+                        str(encode_batch_size),
+                        "--local-dataset-dir",
+                        str(CACHE_PATH / "librispeech"),
+                        "--noise-curriculum-assets-dir",
+                        str(CACHE_PATH / "rirs-noises" / "RIRS_NOISES"),
+                        "--prepare-only",
+                    ]
+                )
+            write_joint_manifest(
+                tail_manifest,
+                fill_manifest,
+                head_manifest,
+                joint_manifest,
+                joint_train_samples,
+            )
+            cache_volume.commit()
+        else:
+            print(
+                f"features={joint_manifest.stem} cached="
+                f"{joint_train_samples}/{joint_train_samples}",
+                flush=True,
+            )
+        stage["value"] = "head_training"
+        run(
+            [
+                "python3",
+                "-m",
+                "scripts.train_speech_presence_head",
+                "--adapter-checkpoint",
+                str(
+                    CACHE_PATH
+                    / "shared-whisper-adapter-librispeech"
+                    / "robust-checkpoints"
+                    / "adapter-20000.pt"
+                ),
+                "--head-train-samples",
+                str(head_train_samples),
+                "--joint-train-samples",
+                str(joint_train_samples),
+                "--joint-train-manifest",
+                str(joint_manifest),
+                "--resume-head-checkpoint",
+                str(
+                    CACHE_PATH
+                    / "shared-whisper-adapter-librispeech"
+                    / "speech-head-10000.pt"
+                ),
+                "--checkpoint-every-samples",
+                str(checkpoint_every_samples),
+                "--head-batch-size",
+                str(head_batch_size),
+                "--joint-batch-size",
+                str(joint_batch_size),
+            ]
+        )
+    finally:
+        stop_monitor.set()
+        monitor.join(timeout=2)
+
+    def summarize(samples: list[tuple[float, float]]) -> dict[str, float]:
+        utilization = [sample[0] for sample in samples]
+        memory = [sample[1] for sample in samples]
+        return {
+            "sampleCount": len(samples),
+            "gpuUtilizationMeanPercent": round(statistics.mean(utilization), 1),
+            "gpuUtilizationP95Percent": round(
+                sorted(utilization)[max(0, int(0.95 * len(utilization)) - 1)], 1
+            ),
+            "gpuUtilizationMaxPercent": round(max(utilization), 1),
+            "memoryMaximumMiB": round(max(memory), 1),
+        }
+
+    result: dict[str, object] = {
+        "gpu": subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            text=True,
+        ).strip(),
+        "headTrainSamples": head_train_samples,
+        "jointTrainSamples": joint_train_samples,
+        "checkpointEverySamples": checkpoint_every_samples,
+        "elapsedSeconds": round(time.monotonic() - started, 1),
+        "checkpointResults": checkpoint_results,
+        "telemetry": {
+            name: summarize(samples) for name, samples in telemetry.items() if samples
+        },
+        "tail": output[-30:],
+    }
+    result_path = (
+        CACHE_PATH
+        / "shared-whisper-adapter-librispeech"
+        / "t4-speech-head-10000-joint-10000.json"
+    )
     result_path.write_text(json.dumps(result, indent=2))
     cache_volume.commit()
     return result
@@ -403,8 +726,14 @@ def main(
     training_microbatch_size: int = 1,
     checkpoint_every_samples: int = 0,
     robust_augmentation: bool = False,
+    noise_curriculum: bool = False,
+    dataset_start_index: int = 0,
+    speech_gate: bool = False,
 ) -> None:
     print(json.dumps(prepare_assets.remote(), indent=2))
+    if speech_gate:
+        print(json.dumps(train_speech_gate_and_joint.remote(), indent=2))
+        return
     final_sample = end_samples or block_start + block_size
     while block_start < final_sample:
         current_size = min(block_size, final_sample - block_start)
@@ -418,6 +747,8 @@ def main(
             training_microbatch_size=training_microbatch_size,
             checkpoint_every_samples=checkpoint_every_samples,
             robust_augmentation=robust_augmentation,
+            noise_curriculum=noise_curriculum,
+            dataset_start_index=dataset_start_index,
         )
         print(json.dumps(result, indent=2))
         block_start += current_size

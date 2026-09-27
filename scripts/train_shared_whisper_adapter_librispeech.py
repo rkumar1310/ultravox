@@ -25,18 +25,20 @@ from datasets import load_dataset
 from jiwer import wer
 from torch.nn.utils.rnn import pad_sequence
 
+from scripts.audio_augmentation import NOISE_PROFILE_NAME
 from scripts.audio_augmentation import PROFILE_NAME
+from scripts.audio_augmentation import NoiseCurriculumAugmenter
 from scripts.audio_augmentation import RobustAudioAugmenter
 from scripts.dual_output_probe import _decode_whisper_official
 from scripts.dual_output_probe import _load_whisper_decoder_model
 from scripts.train_shared_whisper_adapter import HOLDOUT_AUDIO
 from scripts.train_shared_whisper_adapter import MODEL_ID
-from scripts.train_shared_whisper_adapter import ShortStateAdapter
 from scripts.train_shared_whisper_adapter import ULTRAVOX_WEIGHTS
 from scripts.train_shared_whisper_adapter import _load_prefixed_weights
 from scripts.train_shared_whisper_adapter import _read_pcm16_wav
 from scripts.train_shared_whisper_adapter import _teacher_forcing_tokens
 from scripts.train_shared_whisper_adapter import _transcript_loss
+from ultravox.inference.shared_whisper_adapter import ShortStateAdapter
 from ultravox.model.ultravox_model import ModifiedWhisperEncoder
 
 DATASET_ID = "openslr/librispeech_asr"
@@ -68,6 +70,12 @@ def main() -> None:
     parser.add_argument("--training-microbatch-size", type=int, default=1)
     parser.add_argument("--train-start-index", type=int, default=0)
     parser.add_argument(
+        "--dataset-start-index",
+        type=int,
+        default=0,
+        help="Skip this many eligible source rows before preparing training audio.",
+    )
+    parser.add_argument(
         "--checkpoint-offset",
         type=int,
         default=0,
@@ -88,6 +96,14 @@ def main() -> None:
         help="Save and evaluate an in-process checkpoint after this many samples.",
     )
     parser.add_argument("--prepare-only", action="store_true")
+    parser.add_argument(
+        "--allow-partial-prepare",
+        action="store_true",
+        help=(
+            "Persist and return all eligible records when the source split ends "
+            "before train-samples; valid only with --prepare-only."
+        ),
+    )
     parser.add_argument("--rebuild-features", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
@@ -99,6 +115,14 @@ def main() -> None:
         "--augmentation-assets-dir",
         type=pathlib.Path,
         help="Enable deterministic mild noise, room, and speech-overlap augmentation.",
+    )
+    parser.add_argument(
+        "--noise-curriculum-assets-dir",
+        type=pathlib.Path,
+        help=(
+            "Train on silence/noise-only negatives and noise-dominated speech "
+            "using deterministic real noise recordings."
+        ),
     )
     parser.add_argument(
         "--no-synthetic-bootstrap",
@@ -117,6 +141,15 @@ def main() -> None:
         parser.error("checkpoint-every-samples currently requires exactly one epoch")
     if args.checkpoint_offset < 0:
         parser.error("checkpoint-offset cannot be negative")
+    if args.dataset_start_index < 0:
+        parser.error("dataset-start-index cannot be negative")
+    if args.allow_partial_prepare and not args.prepare_only:
+        parser.error("allow-partial-prepare requires prepare-only")
+    if (
+        args.augmentation_assets_dir is not None
+        and args.noise_curriculum_assets_dir is not None
+    ):
+        parser.error("choose either robust augmentation or the noise curriculum")
     if args.resume_checkpoint is not None and not args.resume_checkpoint.exists():
         parser.error(f"resume checkpoint does not exist: {args.resume_checkpoint}")
 
@@ -135,6 +168,9 @@ def main() -> None:
 
     training_augmenter = None
     robust_validation_augmenter = None
+    noise_training_augmenter = None
+    noise_speech_validation_augmenter = None
+    no_speech_validation_augmenter = None
     if args.augmentation_assets_dir is not None:
         training_augmenter = RobustAudioAugmenter(
             args.augmentation_assets_dir, seed=args.seed
@@ -152,13 +188,37 @@ def main() -> None:
             ),
             flush=True,
         )
+    if args.noise_curriculum_assets_dir is not None:
+        noise_training_augmenter = NoiseCurriculumAugmenter(
+            args.noise_curriculum_assets_dir, seed=args.seed + 20_000
+        )
+        noise_speech_validation_augmenter = NoiseCurriculumAugmenter(
+            args.noise_curriculum_assets_dir, seed=args.seed + 30_000
+        )
+        no_speech_validation_augmenter = NoiseCurriculumAugmenter(
+            args.noise_curriculum_assets_dir, seed=args.seed + 40_000
+        )
+        print(
+            "augmentation="
+            + json.dumps(
+                {
+                    "profile": NOISE_PROFILE_NAME,
+                    **noise_training_augmenter.asset_counts,
+                }
+            ),
+            flush=True,
+        )
 
     train_records = _prepare_split(
         processor=processor,
         device=device,
         dtype=dtype,
         dataset_split="train.100",
-        output_split=(f"train-{PROFILE_NAME}" if training_augmenter else "train"),
+        output_split=(
+            f"train-{NOISE_PROFILE_NAME}-{args.dataset_start_index:05d}"
+            if noise_training_augmenter
+            else (f"train-{PROFILE_NAME}" if training_augmenter else "train")
+        ),
         sample_count=args.train_samples,
         seed=args.seed,
         shuffle_buffer=args.shuffle_buffer,
@@ -167,6 +227,10 @@ def main() -> None:
         rebuild=args.rebuild_features,
         local_dataset_dir=args.local_dataset_dir,
         augmenter=training_augmenter,
+        noise_augmenter=noise_training_augmenter,
+        noise_kind=None,
+        dataset_start_index=args.dataset_start_index,
+        allow_partial=args.allow_partial_prepare,
     )
     validation_records = _prepare_split(
         processor=processor,
@@ -182,6 +246,10 @@ def main() -> None:
         rebuild=args.rebuild_features,
         local_dataset_dir=args.local_dataset_dir,
         augmenter=None,
+        noise_augmenter=None,
+        noise_kind=None,
+        dataset_start_index=0,
+        allow_partial=False,
     )
     robust_validation_records: list[FeatureRecord] = []
     if robust_validation_augmenter is not None:
@@ -199,6 +267,51 @@ def main() -> None:
             rebuild=args.rebuild_features,
             local_dataset_dir=args.local_dataset_dir,
             augmenter=robust_validation_augmenter,
+            noise_augmenter=None,
+            noise_kind=None,
+            dataset_start_index=0,
+            allow_partial=False,
+        )
+    noise_speech_validation_records: list[FeatureRecord] = []
+    no_speech_validation_records: list[FeatureRecord] = []
+    if noise_speech_validation_augmenter is not None:
+        noise_speech_validation_records = _prepare_split(
+            processor=processor,
+            device=device,
+            dtype=dtype,
+            dataset_split="validation",
+            output_split=f"validation-{NOISE_PROFILE_NAME}-speech",
+            sample_count=args.validation_samples,
+            seed=args.seed + 30_000,
+            shuffle_buffer=0,
+            encode_batch_size=args.encode_batch_size,
+            max_duration_seconds=args.max_duration_seconds,
+            rebuild=args.rebuild_features,
+            local_dataset_dir=args.local_dataset_dir,
+            augmenter=None,
+            noise_augmenter=noise_speech_validation_augmenter,
+            noise_kind="noise-dominated-speech",
+            dataset_start_index=0,
+            allow_partial=False,
+        )
+        no_speech_validation_records = _prepare_split(
+            processor=processor,
+            device=device,
+            dtype=dtype,
+            dataset_split="validation",
+            output_split=f"validation-{NOISE_PROFILE_NAME}-empty",
+            sample_count=args.validation_samples,
+            seed=args.seed + 40_000,
+            shuffle_buffer=0,
+            encode_batch_size=args.encode_batch_size,
+            max_duration_seconds=args.max_duration_seconds,
+            rebuild=args.rebuild_features,
+            local_dataset_dir=args.local_dataset_dir,
+            augmenter=None,
+            noise_augmenter=no_speech_validation_augmenter,
+            noise_kind="no-speech",
+            dataset_start_index=0,
+            allow_partial=False,
         )
     print(
         json.dumps(
@@ -209,6 +322,8 @@ def main() -> None:
                 "trainSamples": len(train_records),
                 "validationSamples": len(validation_records),
                 "robustValidationSamples": len(robust_validation_records),
+                "noiseSpeechValidationSamples": len(noise_speech_validation_records),
+                "noSpeechValidationSamples": len(no_speech_validation_records),
                 "trainHours": round(
                     sum(record.duration_seconds for record in train_records) / 3600,
                     3,
@@ -219,6 +334,19 @@ def main() -> None:
                 "robustValidationAugmentationStats": (
                     robust_validation_augmenter.stats
                     if robust_validation_augmenter
+                    else None
+                ),
+                "noiseTrainingStats": (
+                    noise_training_augmenter.stats if noise_training_augmenter else None
+                ),
+                "noiseSpeechValidationStats": (
+                    noise_speech_validation_augmenter.stats
+                    if noise_speech_validation_augmenter
+                    else None
+                ),
+                "noSpeechValidationStats": (
+                    no_speech_validation_augmenter.stats
+                    if no_speech_validation_augmenter
                     else None
                 ),
                 "validationHours": round(
@@ -236,18 +364,25 @@ def main() -> None:
 
     training_records = train_records[args.train_start_index :]
     robust_run = args.augmentation_assets_dir is not None
-    run_checkpoint = (
-        WORK_DIR / "adapter-asr-robust-latest.pt" if robust_run else CHECKPOINT
-    )
-    checkpoint_dir = WORK_DIR / (
-        "robust-checkpoints" if robust_run else "checkpoints"
-    )
-    best_checkpoint = (
-        WORK_DIR / "adapter-asr-robust-best.pt" if robust_run else run_checkpoint
-    )
-    results_path = (
-        WORK_DIR / "robust-10000-20000-results.jsonl" if robust_run else None
-    )
+    noise_run = args.noise_curriculum_assets_dir is not None
+    if noise_run:
+        run_checkpoint = WORK_DIR / "adapter-asr-noise-latest.pt"
+        checkpoint_dir = WORK_DIR / "noise-checkpoints"
+        best_checkpoint = WORK_DIR / "adapter-asr-noise-best.pt"
+        results_path = WORK_DIR / (
+            f"noise-{args.checkpoint_offset:05d}-"
+            f"{args.checkpoint_offset + len(training_records):05d}-results.jsonl"
+        )
+    elif robust_run:
+        run_checkpoint = WORK_DIR / "adapter-asr-robust-latest.pt"
+        checkpoint_dir = WORK_DIR / "robust-checkpoints"
+        best_checkpoint = WORK_DIR / "adapter-asr-robust-best.pt"
+        results_path = WORK_DIR / "robust-10000-20000-results.jsonl"
+    else:
+        run_checkpoint = CHECKPOINT
+        checkpoint_dir = WORK_DIR / "checkpoints"
+        best_checkpoint = run_checkpoint
+        results_path = None
     if results_path is not None:
         results_path.unlink(missing_ok=True)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -276,9 +411,9 @@ def main() -> None:
 
     checkpoint_results: list[dict[str, object]] = []
     best_validation_loss = float("inf")
-    best_validation_wer = float("inf")
+    best_validation_score = float("inf")
     best_trained_samples = args.checkpoint_offset + args.train_start_index
-    if robust_run:
+    if robust_run or noise_run:
         baseline_result = _evaluate_checkpoint(
             trained_samples=best_trained_samples,
             checkpoint_path=args.resume_checkpoint or run_checkpoint,
@@ -288,6 +423,8 @@ def main() -> None:
             processor=processor,
             clean_records=validation_records,
             robust_records=robust_validation_records,
+            noise_speech_records=noise_speech_validation_records,
+            no_speech_records=no_speech_validation_records,
             validation_loss_samples=args.validation_loss_samples,
             validation_decode_samples=args.validation_decode_samples,
             device=device,
@@ -295,7 +432,7 @@ def main() -> None:
         )
         checkpoint_results.append(baseline_result)
         best_validation_loss = float(baseline_result["validationCe"])
-        best_validation_wer = float(baseline_result["validationWer"])
+        best_validation_score = float(baseline_result["selectionScore"])
         torch.save(adapter.state_dict(), best_checkpoint)
         _append_jsonl(results_path, baseline_result)
         print("checkpoint_result=" + json.dumps(baseline_result), flush=True)
@@ -327,9 +464,7 @@ def main() -> None:
             for batch_index in batch_order:
                 indexes = batches[batch_index]
                 records = [chunk_records[index] for index in indexes]
-                tensors = _load_training_batch(
-                    records, processor, torch.device("cpu")
-                )
+                tensors = _load_training_batch(records, processor, torch.device("cpu"))
                 if device.type == "cuda":
                     tensors = tuple(tensor.pin_memory() for tensor in tensors)
                 prepared_batches.append((len(records), tensors))
@@ -340,8 +475,7 @@ def main() -> None:
                 + len(chunk_records)
             )
             print(
-                f"stage=adapter_training_start epoch={epoch} "
-                f"checkpoint={absolute_end}",
+                f"stage=adapter_training_start epoch={epoch} checkpoint={absolute_end}",
                 flush=True,
             )
             chunk_processed = 0
@@ -382,14 +516,11 @@ def main() -> None:
                 flush=True,
             )
             print(
-                f"stage=validation_loss_start epoch={epoch} "
-                f"checkpoint={absolute_end}",
+                f"stage=validation_loss_start epoch={epoch} checkpoint={absolute_end}",
                 flush=True,
             )
             torch.save(adapter.state_dict(), run_checkpoint)
-            milestone_checkpoint = (
-                checkpoint_dir / f"adapter-{absolute_end:04d}.pt"
-            )
+            milestone_checkpoint = checkpoint_dir / f"adapter-{absolute_end:04d}.pt"
             torch.save(adapter.state_dict(), milestone_checkpoint)
             print(
                 f"stage=validation_decode_start checkpoint={absolute_end}",
@@ -404,16 +535,18 @@ def main() -> None:
                 processor=processor,
                 clean_records=validation_records,
                 robust_records=robust_validation_records,
+                noise_speech_records=noise_speech_validation_records,
+                no_speech_records=no_speech_validation_records,
                 validation_loss_samples=args.validation_loss_samples,
                 validation_decode_samples=args.validation_decode_samples,
                 device=device,
                 dtype=dtype,
             )
             validation_loss = float(checkpoint_result["validationCe"])
-            checkpoint_wer = float(checkpoint_result["validationWer"])
+            checkpoint_score = float(checkpoint_result["selectionScore"])
             best_validation_loss = min(best_validation_loss, validation_loss)
-            if checkpoint_wer < best_validation_wer:
-                best_validation_wer = checkpoint_wer
+            if checkpoint_score < best_validation_score:
+                best_validation_score = checkpoint_score
                 best_trained_samples = absolute_end
                 shutil.copy2(milestone_checkpoint, best_checkpoint)
             print(
@@ -445,9 +578,10 @@ def main() -> None:
         "checkpoint": str(run_checkpoint),
         "bestCheckpoint": str(best_checkpoint),
         "bestCheckpointSamples": best_trained_samples,
-        "bestValidationWer": best_validation_wer,
+        "bestValidationScore": best_validation_score,
         "checkpointResultsPath": str(results_path) if results_path else None,
         "trainStartIndex": args.train_start_index,
+        "datasetStartIndex": args.dataset_start_index,
         "trainEndIndex": args.train_samples,
         "checkpointOffset": args.checkpoint_offset,
         "trainingMicrobatchSize": args.training_microbatch_size,
@@ -474,6 +608,8 @@ def _evaluate_checkpoint(
     processor,
     clean_records: list[FeatureRecord],
     robust_records: list[FeatureRecord],
+    noise_speech_records: list[FeatureRecord],
+    no_speech_records: list[FeatureRecord],
     validation_loss_samples: int,
     validation_decode_samples: int,
     device: torch.device,
@@ -503,9 +639,45 @@ def _evaluate_checkpoint(
         device=device,
         dtype=dtype,
     )
+    noise_speech_decoded = _decode_validation(
+        adapter=adapter,
+        decoder=decoder,
+        processor=processor,
+        records=noise_speech_records[:validation_decode_samples],
+        device=device,
+        dtype=dtype,
+    )
+    no_speech_decoded = _decode_validation(
+        adapter=adapter,
+        decoder=decoder,
+        processor=processor,
+        records=no_speech_records[:validation_decode_samples],
+        device=device,
+        dtype=dtype,
+    )
     clean_wer = _decoded_wer(clean_decoded)
     robust_wer = _decoded_wer(robust_decoded) if robust_decoded else clean_wer
+    noise_speech_wer = (
+        _decoded_wer(noise_speech_decoded) if noise_speech_decoded else clean_wer
+    )
+    false_transcriptions = [
+        item for item in no_speech_decoded if _normalize_for_wer(item["hypothesis"])
+    ]
+    no_speech_false_positive_rate = (
+        len(false_transcriptions) / len(no_speech_decoded) if no_speech_decoded else 0.0
+    )
+    no_speech_hallucinated_words = sum(
+        len(_normalize_for_wer(item["hypothesis"]).split())
+        for item in no_speech_decoded
+    )
     combined = [*clean_decoded, *robust_decoded]
+    selection_score = clean_wer
+    if robust_decoded:
+        selection_score += robust_wer
+    if noise_speech_decoded:
+        selection_score += noise_speech_wer
+    if no_speech_decoded:
+        selection_score += no_speech_false_positive_rate
     return {
         "trainedSamples": trained_samples,
         "checkpoint": str(checkpoint_path),
@@ -514,10 +686,23 @@ def _evaluate_checkpoint(
         "validationWer": _decoded_wer(combined),
         "cleanValidationWer": clean_wer,
         "robustValidationWer": robust_wer,
-        "decodedValidationSamples": len(combined),
+        "noiseSpeechValidationWer": noise_speech_wer,
+        "noSpeechFalsePositiveRate": no_speech_false_positive_rate,
+        "noSpeechHallucinatedWords": no_speech_hallucinated_words,
+        "selectionScore": selection_score,
+        "decodedValidationSamples": (
+            len(combined) + len(noise_speech_decoded) + len(no_speech_decoded)
+        ),
         "cleanExamples": clean_decoded[:3],
         "robustExamples": robust_decoded[:3],
-        "examples": combined[:5],
+        "noiseSpeechExamples": noise_speech_decoded[:3],
+        "noSpeechExamples": no_speech_decoded[:3],
+        "examples": [
+            *clean_decoded[:2],
+            *robust_decoded[:1],
+            *noise_speech_decoded[:1],
+            *no_speech_decoded[:1],
+        ],
     }
 
 
@@ -552,6 +737,10 @@ def _prepare_split(
     rebuild: bool,
     local_dataset_dir: pathlib.Path | None,
     augmenter: RobustAudioAugmenter | None,
+    noise_augmenter: NoiseCurriculumAugmenter | None,
+    noise_kind: str | None,
+    dataset_start_index: int,
+    allow_partial: bool,
 ) -> list[FeatureRecord]:
     output_dir = FEATURE_DIR / output_split
     manifest_path = FEATURE_DIR / f"{output_split}.jsonl"
@@ -619,6 +808,7 @@ def _prepare_split(
     pending: list[tuple[str, str, np.ndarray, float, pathlib.Path]] = []
     last_manifest_count = len(existing)
     started = time.monotonic()
+    eligible_index = 0
     for row in dataset:
         if len(records) + len(pending) >= sample_count:
             break
@@ -626,9 +816,24 @@ def _prepare_split(
         duration_seconds = len(audio) / sample_rate
         if duration_seconds > max_duration_seconds or not row["text"].strip():
             continue
+        if eligible_index < dataset_start_index:
+            eligible_index += 1
+            continue
+        eligible_index += 1
 
         index = len(records) + len(pending)
         sample_id = str(row["id"])
+        target_text = str(row["text"])
+        clean_audio = audio
+        if noise_augmenter is not None:
+            augmented = noise_augmenter.augment(
+                sample_id,
+                clean_audio,
+                force_kind=noise_kind,
+            )
+            audio = augmented.samples
+            if not augmented.target_has_speech:
+                target_text = ""
         feature_path = output_dir / f"{index:05d}-{sample_id}.pt"
         if not pending and index < len(existing):
             cached = existing[index]
@@ -642,7 +847,7 @@ def _prepare_split(
                 FeatureRecord(
                     dataset_split=dataset_split,
                     sample_id=sample_id,
-                    text=str(row["text"]),
+                    text=target_text,
                     duration_seconds=duration_seconds,
                     path=feature_path,
                 )
@@ -654,14 +859,13 @@ def _prepare_split(
                 last_manifest_count = len(records)
             _report_feature_progress(output_split, len(records), sample_count, started)
             continue
-        clean_audio = audio
         if augmenter is not None:
             audio = augmenter.augment(sample_id, clean_audio).samples
             augmenter.observe(sample_id, clean_audio)
         pending.append(
             (
                 sample_id,
-                str(row["text"]),
+                target_text,
                 audio,
                 duration_seconds,
                 feature_path,
@@ -703,12 +907,17 @@ def _prepare_split(
         torch.mps.empty_cache()
     elif device.type == "cuda":
         torch.cuda.empty_cache()
-    if len(records) != sample_count:
+    _write_manifest(manifest_path, records)
+    if len(records) != sample_count and not allow_partial:
         raise RuntimeError(
             f"Only prepared {len(records)} of {sample_count} requested "
             f"examples for {dataset_split}"
         )
-    _write_manifest(manifest_path, records)
+    if len(records) != sample_count:
+        print(
+            f"features={output_split} partial={len(records)}/{sample_count}",
+            flush=True,
+        )
     return records
 
 

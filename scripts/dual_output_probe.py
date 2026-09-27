@@ -11,17 +11,23 @@ import wave
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 import transformers
 from transformers.modeling_outputs import BaseModelOutput
 
 from ultravox.model.ultravox_config import UltravoxConfig
 from ultravox.model.ultravox_model import UltravoxModel
 from ultravox.model.ultravox_processing import UltravoxProcessor
+from ultravox.inference.shared_whisper_adapter import GatedWhisperAdapter
 
 DEFAULT_ULTRAVOX_MODEL = pathlib.Path(".model-cache/ultravox-v05")
 DEFAULT_TEXT_MODEL = "unsloth/Llama-3.2-1B-Instruct"
 DEFAULT_WHISPER_MODEL = "openai/whisper-large-v3-turbo"
+DEFAULT_ADAPTER_CHECKPOINT = pathlib.Path(
+    "checkpoints/shared-whisper-adapter/adapter-asr-robust-20000.pt"
+)
+DEFAULT_SPEECH_HEAD_CHECKPOINT = pathlib.Path(
+    "checkpoints/shared-whisper-adapter/speech-head-best-16000.pt"
+)
 EXPECTED_TRANSCRIPT = (
     "My project codename is blue bicycle seven. Please schedule the launch "
     "for Tuesday at nine in the morning."
@@ -31,9 +37,22 @@ EXPECTED_TRANSCRIPT = (
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("audio", type=pathlib.Path)
-    parser.add_argument("--ultravox-model", type=pathlib.Path, default=DEFAULT_ULTRAVOX_MODEL)
+    parser.add_argument(
+        "--ultravox-model", type=pathlib.Path, default=DEFAULT_ULTRAVOX_MODEL
+    )
     parser.add_argument("--text-model", default=DEFAULT_TEXT_MODEL)
     parser.add_argument("--whisper-model", default=DEFAULT_WHISPER_MODEL)
+    parser.add_argument(
+        "--adapter-checkpoint",
+        type=pathlib.Path,
+        default=DEFAULT_ADAPTER_CHECKPOINT,
+    )
+    parser.add_argument(
+        "--speech-head-checkpoint",
+        type=pathlib.Path,
+        default=DEFAULT_SPEECH_HEAD_CHECKPOINT,
+    )
+    parser.add_argument("--speech-threshold", type=float, default=0.5)
     parser.add_argument("--max-response-tokens", type=int, default=24)
     parser.add_argument("--max-transcript-tokens", type=int, default=64)
     args = parser.parse_args()
@@ -44,6 +63,12 @@ def main() -> None:
 
     whisper_processor = transformers.AutoProcessor.from_pretrained(args.whisper_model)
     whisper_model = _load_whisper_decoder_model(args.whisper_model, device, dtype)
+    transcription_adapter = GatedWhisperAdapter.from_checkpoints(
+        adapter_checkpoint=args.adapter_checkpoint,
+        speech_head_checkpoint=args.speech_head_checkpoint,
+        device=device,
+        threshold=args.speech_threshold,
+    )
     model, tokenizer, processor = _load_ultravox(
         args.ultravox_model, args.text_model, device, dtype
     )
@@ -76,6 +101,7 @@ def main() -> None:
             inputs["audio_values"].to(dtype),
             audio_len=inputs.get("audio_len"),
         ).last_hidden_state
+        gated_transcription = transcription_adapter(shared_encoder_state)
     _sync(device)
     encoder_ms = (time.perf_counter() - encode_started) * 1_000
 
@@ -93,81 +119,43 @@ def main() -> None:
         model.language_model,
         response_inputs,
         inputs["attention_mask"],
-        stop_ids={tokenizer.eos_token_id, tokenizer.convert_tokens_to_ids("<|eot_id|>")},
+        stop_ids={
+            tokenizer.eos_token_id,
+            tokenizer.convert_tokens_to_ids("<|eot_id|>"),
+        },
         max_new_tokens=args.max_response_tokens,
     )
-    transcript_ids = _decode_whisper_official(
-        model=whisper_model,
-        encoder_state=shared_encoder_state,
-        max_new_tokens=args.max_transcript_tokens,
-    )
-    zero_padded_encoder_state = F.pad(
-        shared_encoder_state,
-        (0, 0, 0, model.config.audio_config.max_source_positions - shared_encoder_state.shape[1]),
-    )
-    zero_padded_transcript_ids = _decode_whisper_official(
-        model=whisper_model,
-        encoder_state=zero_padded_encoder_state,
-        max_new_tokens=args.max_transcript_tokens,
-    )
-    silence_features = whisper_processor(
-        np.zeros(30 * 16_000, dtype=np.float32),
-        sampling_rate=16_000,
-        return_tensors="pt",
-    ).input_features.to(device=device, dtype=dtype)
-    silence_encoder_state = model.audio_tower(
-        silence_features,
-        audio_len=None,
-    ).last_hidden_state
-    speech_frames = shared_encoder_state.shape[1]
-    silence_tail_encoder_state = torch.cat(
-        [shared_encoder_state, silence_encoder_state[:, speech_frames:]], dim=1
-    )
-    silence_tail_transcript_ids = _decode_whisper_official(
-        model=whisper_model,
-        encoder_state=silence_tail_encoder_state,
-        max_new_tokens=args.max_transcript_tokens,
-    )
-    # Diagnostic only: stock Whisper normally pads every utterance to 30 seconds.
-    # A second encoder pass here isolates that behavior from encoder fine-tuning.
-    padded_features = whisper_processor(
-        audio,
-        sampling_rate=16_000,
-        return_tensors="pt",
-    ).input_features.to(device=device, dtype=dtype)
-    padded_encoder_state = model.audio_tower(
-        padded_features,
-        audio_len=None,
-    ).last_hidden_state
-    padded_transcript_ids = _decode_whisper_official(
-        model=whisper_model,
-        encoder_state=padded_encoder_state,
-        max_new_tokens=args.max_transcript_tokens,
-    )
+    transcript_ids: list[int] = []
+    if gated_transcription.whisper_encoder_states is not None:
+        transcript_ids = _decode_whisper_official(
+            model=whisper_model,
+            encoder_state=gated_transcription.whisper_encoder_states,
+            max_new_tokens=args.max_transcript_tokens,
+        )
     _sync(device)
     decode_ms = (time.perf_counter() - decode_started) * 1_000
 
     response = tokenizer.decode(response_ids, skip_special_tokens=True).strip()
-    transcript = whisper_processor.batch_decode(
-        [transcript_ids], skip_special_tokens=True
-    )[0].strip()
-    zero_padded_transcript = whisper_processor.batch_decode(
-        [zero_padded_transcript_ids], skip_special_tokens=True
-    )[0].strip()
-    silence_tail_transcript = whisper_processor.batch_decode(
-        [silence_tail_transcript_ids], skip_special_tokens=True
-    )[0].strip()
-    padded_transcript = whisper_processor.batch_decode(
-        [padded_transcript_ids], skip_special_tokens=True
-    )[0].strip()
+    transcript = (
+        whisper_processor.batch_decode([transcript_ids], skip_special_tokens=True)[
+            0
+        ].strip()
+        if transcript_ids
+        else ""
+    )
+    speech_probability = float(gated_transcription.speech_probabilities[0].cpu())
     result = {
         "expectedTranscript": EXPECTED_TRANSCRIPT,
         "biasedPrompt": system_prompt,
         "llamaResponse": response,
         "whisperTranscript": transcript,
-        "whisperTranscriptWithZeroPaddedStateDiagnostic": zero_padded_transcript,
-        "whisperTranscriptWithCachedSilenceTailDiagnostic": silence_tail_transcript,
-        "whisperTranscriptWithStockPaddingDiagnostic": padded_transcript,
+        "speechProbability": round(speech_probability, 6),
+        "speechThreshold": args.speech_threshold,
+        "transcriptionSuppressed": not bool(
+            gated_transcription.should_transcribe[0].item()
+        ),
+        "adapterCheckpoint": str(args.adapter_checkpoint),
+        "speechHeadCheckpoint": str(args.speech_head_checkpoint),
         "sharedEncoderPasses": 1,
         "encoderMs": round(encoder_ms, 1),
         "combinedDecodeMs": round(decode_ms, 1),
@@ -238,9 +226,7 @@ def _inject_shared_audio(
     audio_length: int,
 ) -> torch.Tensor:
     embeddings = model.get_input_embeddings()(input_ids)
-    audio_embeddings = model.multi_modal_projector(
-        encoder_state.to(embeddings.dtype)
-    )
+    audio_embeddings = model.multi_modal_projector(encoder_state.to(embeddings.dtype))
     audio_length = min(audio_length, audio_embeddings.shape[1])
     embeddings[:, audio_start : audio_start + audio_length] = audio_embeddings[
         :, :audio_length

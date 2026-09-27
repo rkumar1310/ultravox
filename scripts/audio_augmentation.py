@@ -13,6 +13,7 @@ from scipy.signal import fftconvolve
 
 
 PROFILE_NAME = "robust-v1"
+NOISE_PROFILE_NAME = "noise-v2"
 
 
 @dataclass(frozen=True)
@@ -21,6 +22,14 @@ class AugmentationResult:
     used_noise: bool
     used_room: bool
     used_overlap: bool
+
+
+@dataclass(frozen=True)
+class NoiseCurriculumResult:
+    samples: np.ndarray
+    target_has_speech: bool
+    kind: str
+    snr_db: float | None
 
 
 class RobustAudioAugmenter:
@@ -113,6 +122,100 @@ class RobustAudioAugmenter:
             del self._reservoir[0]
 
 
+class NoiseCurriculumAugmenter:
+    """Creates no-speech negatives and deliberately noise-dominated speech."""
+
+    def __init__(
+        self,
+        assets_dir: pathlib.Path,
+        *,
+        seed: int,
+        sample_rate: int = 16_000,
+    ) -> None:
+        self.seed = seed
+        self.sample_rate = sample_rate
+        wav_paths = sorted(assets_dir.rglob("*.wav"))
+        self._noise_paths = [path for path in wav_paths if _is_noise_path(path)]
+        if not self._noise_paths:
+            raise FileNotFoundError(f"no noise WAV files found below {assets_dir}")
+        self.stats = {
+            "samples": 0,
+            "silence": 0,
+            "noise-only": 0,
+            "noise-dominated-speech": 0,
+            "moderate-noise-speech": 0,
+            "mild-noise-speech": 0,
+        }
+
+    @property
+    def asset_counts(self) -> dict[str, int]:
+        return {"noiseFiles": len(self._noise_paths)}
+
+    def augment(
+        self,
+        sample_id: str,
+        samples: np.ndarray,
+        *,
+        force_kind: str | None = None,
+    ) -> NoiseCurriculumResult:
+        rng = np.random.default_rng(_stable_seed(self.seed, sample_id))
+        speech = np.asarray(samples, dtype=np.float32)
+        kind = force_kind or self._choose_kind(rng)
+        if kind == "no-speech":
+            kind = "silence" if rng.random() < 0.5 else "noise-only"
+        snr_db: float | None = None
+        target_has_speech = kind not in {"silence", "noise-only"}
+
+        if kind == "silence":
+            # Half are exact zero; half carry barely audible electronic noise.
+            if rng.random() < 0.5:
+                output = np.zeros_like(speech)
+            else:
+                output = rng.normal(size=len(speech)).astype(np.float32)
+                output = _scale_to_rms(output, 10 ** (rng.uniform(-70, -45) / 20))
+        else:
+            noise_path = self._noise_paths[int(rng.integers(len(self._noise_paths)))]
+            noise = _noise_segment(
+                _read_mono(noise_path, self.sample_rate), len(speech), rng
+            )
+            if kind == "noise-only":
+                # Cover quiet room tone through loud environmental noise.
+                output = _scale_to_rms(noise, 10 ** (rng.uniform(-50, -10) / 20))
+            else:
+                if kind == "noise-dominated-speech":
+                    snr_db = float(rng.uniform(-15.0, -8.0))
+                elif kind == "moderate-noise-speech":
+                    snr_db = float(rng.uniform(-8.0, 3.0))
+                elif kind == "mild-noise-speech":
+                    snr_db = float(rng.uniform(3.0, 12.0))
+                else:
+                    raise ValueError(f"unsupported noise curriculum kind: {kind}")
+                output = _mix_at_snr(speech, noise, snr_db)
+
+        output = _safe_peak(output)
+        self.stats["samples"] += 1
+        self.stats[kind] += 1
+        return NoiseCurriculumResult(
+            samples=output,
+            target_has_speech=target_has_speech,
+            kind=kind,
+            snr_db=snr_db,
+        )
+
+    @staticmethod
+    def _choose_kind(rng: np.random.Generator) -> str:
+        draw = float(rng.random())
+        if draw < 0.10:
+            return "silence"
+        if draw < 0.25:
+            return "noise-only"
+        if draw < 0.75:
+            return "noise-dominated-speech"
+        if draw < 0.95:
+            return "moderate-noise-speech"
+        return "mild-noise-speech"
+
+
 def _stable_seed(seed: int, sample_id: str) -> int:
     digest = hashlib.sha256(f"{seed}:{sample_id}".encode()).digest()
     return int.from_bytes(digest[:8], "little")
@@ -184,6 +287,45 @@ def _add_noise(
         return speech
     scale = _rms(speech) / (10.0 ** (snr_db / 20.0) * noise_rms)
     return (speech + segment * scale).astype(np.float32)
+
+
+def _noise_segment(
+    noise: np.ndarray, length: int, rng: np.random.Generator
+) -> np.ndarray:
+    if not noise.size:
+        return np.zeros(length, dtype=np.float32)
+    if len(noise) < length:
+        noise = np.tile(noise, int(np.ceil(length / len(noise))))
+    start = int(rng.integers(0, len(noise) - length + 1))
+    segment = np.asarray(noise[start : start + length], dtype=np.float32).copy()
+    segment -= float(segment.mean())
+    return segment
+
+
+def _scale_to_rms(samples: np.ndarray, target_rms: float) -> np.ndarray:
+    current_rms = _rms(samples)
+    if current_rms <= 1e-8:
+        return np.zeros_like(samples, dtype=np.float32)
+    return np.asarray(samples * (target_rms / current_rms), dtype=np.float32)
+
+
+def _mix_at_snr(
+    speech: np.ndarray, noise: np.ndarray, snr_db: float
+) -> np.ndarray:
+    speech_rms = _rms(speech)
+    noise_rms = _rms(noise)
+    if speech_rms <= 1e-8 or noise_rms <= 1e-8:
+        return np.asarray(speech, dtype=np.float32)
+    noise_scale = speech_rms / (10 ** (snr_db / 20) * noise_rms)
+    return np.asarray(speech + noise * noise_scale, dtype=np.float32)
+
+
+def _safe_peak(samples: np.ndarray) -> np.ndarray:
+    output = np.asarray(samples, dtype=np.float32)
+    peak = float(np.max(np.abs(output))) if output.size else 0.0
+    if peak > 0.979:
+        output = output * (0.979 / peak)
+    return np.asarray(output, dtype=np.float32)
 
 
 def _add_competing_speech(

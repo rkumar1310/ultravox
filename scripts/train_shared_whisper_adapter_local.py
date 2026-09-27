@@ -28,7 +28,6 @@ from torch.nn.utils.rnn import pad_sequence
 from scripts.dual_output_probe import _decode_whisper_official
 from scripts.dual_output_probe import _load_whisper_decoder_model
 from scripts.train_shared_whisper_adapter import MODEL_ID
-from scripts.train_shared_whisper_adapter import ShortStateAdapter
 from scripts.train_shared_whisper_adapter import ULTRAVOX_WEIGHTS
 from scripts.train_shared_whisper_adapter import _load_prefixed_weights
 from scripts.train_shared_whisper_adapter import _teacher_forcing_tokens
@@ -36,6 +35,7 @@ from scripts.train_shared_whisper_adapter_librispeech import DATASET_CONFIG
 from scripts.train_shared_whisper_adapter_librispeech import DATASET_ID
 from scripts.train_shared_whisper_adapter_librispeech import _batched_transcript_loss
 from scripts.train_shared_whisper_adapter_librispeech import _normalize_for_wer
+from ultravox.inference.shared_whisper_adapter import ShortStateAdapter
 from ultravox.model.ultravox_model import ModifiedWhisperEncoder
 
 WORK_DIR = pathlib.Path(".model-cache/shared-whisper-adapter-librispeech")
@@ -77,7 +77,9 @@ def main() -> None:
     if (args.target_samples - args.start_samples) % args.checkpoint_every_samples:
         parser.error("the requested range must divide into complete checkpoints")
     if not BASE_MANIFEST.exists() or not VALIDATION_MANIFEST.exists():
-        parser.error("the downloaded 10k training and validation manifests are required")
+        parser.error(
+            "the downloaded 10k training and validation manifests are required"
+        )
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -184,9 +186,7 @@ def main() -> None:
                 torch.mps.empty_cache()
 
         print(f"loading_checkpoint={resume_checkpoint}", flush=True)
-        decoder = _load_whisper_decoder_model(
-            MODEL_ID, device, decoder_dtype
-        ).eval()
+        decoder = _load_whisper_decoder_model(MODEL_ID, device, decoder_dtype).eval()
         for parameter in decoder.parameters():
             parameter.requires_grad_(False)
         adapter = ShortStateAdapter().to(device=device, dtype=torch.float32)
@@ -196,9 +196,7 @@ def main() -> None:
         optimizer = torch.optim.AdamW(adapter.parameters(), lr=args.learning_rate)
         if resume_optimizer.exists():
             optimizer.load_state_dict(
-                torch.load(
-                    resume_optimizer, map_location=device, weights_only=True
-                )
+                torch.load(resume_optimizer, map_location=device, weights_only=True)
             )
             print(f"loading_optimizer={resume_optimizer}", flush=True)
         train_ce, samples_per_second, sanitized_gradient_elements = _train_block(
@@ -374,9 +372,7 @@ def _prepare_validation(
         if sample_id not in expected:
             continue
         audio, sample_rate = _decode_audio(row["audio"])
-        pending.append(
-            (sample_id, str(row["text"]), audio, len(audio) / sample_rate)
-        )
+        pending.append((sample_id, str(row["text"]), audio, len(audio) / sample_rate))
         if len(pending) >= encode_batch_size:
             for record in _encode_pending(encoder, processor, pending, device, dtype):
                 ordered[record.sample_id] = record
@@ -532,8 +528,7 @@ def _train_block(
         if sanitized:
             print(
                 f"sanitized_gradient_elements={sanitized} "
-                "samples="
-                + ",".join(record.sample_id for record in records),
+                "samples=" + ",".join(record.sample_id for record in records),
                 flush=True,
             )
         optimizer.step()
@@ -582,9 +577,7 @@ def _sanitize_and_clip_grad_norm_(
     # torch.nn.utils.clip_grad_norm_ can overflow its MPS reduction even when
     # every individual gradient is finite.  Rescaling before squaring avoids
     # that reduction bug while preserving the actual norm and clip factor.
-    scaled_sum = torch.zeros(
-        (), device=gradients[0].device, dtype=torch.float32
-    )
+    scaled_sum = torch.zeros((), device=gradients[0].device, dtype=torch.float32)
     for gradient in gradients:
         scaled_sum.add_((gradient.float() / reduction_scale).square().sum())
     total_norm = scaled_sum.sqrt() * reduction_scale
@@ -690,9 +683,9 @@ def _decode_validation(
             encoder_state=state,
             max_new_tokens=128,
         )
-        hypothesis = processor.batch_decode(
-            [token_ids], skip_special_tokens=True
-        )[0].strip()
+        hypothesis = processor.batch_decode([token_ids], skip_special_tokens=True)[
+            0
+        ].strip()
         decoded.append(
             {
                 "id": record.sample_id,

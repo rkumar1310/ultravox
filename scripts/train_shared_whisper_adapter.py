@@ -7,8 +7,6 @@ import gc
 import json
 import pathlib
 import subprocess
-import time
-import wave
 
 import numpy as np
 import torch
@@ -21,6 +19,7 @@ from transformers.models.whisper.modeling_whisper import WhisperEncoder
 from scripts.dual_output_probe import _decode_whisper_official
 from scripts.dual_output_probe import _load_whisper_decoder_model
 from scripts.dual_output_probe import _read_pcm16_wav
+from ultravox.inference.shared_whisper_adapter import ShortStateAdapter
 from ultravox.model.ultravox_model import ModifiedWhisperEncoder
 
 MODEL_ID = "openai/whisper-large-v3-turbo"
@@ -55,51 +54,6 @@ TRAIN_SENTENCES = [
     "The account balance was updated earlier this morning.",
 ]
 VOICES = ["Daniel", "Flo (English (US))", "Aman"]
-
-
-class ShortStateAdapter(nn.Module):
-    """Cross-attend fixed Whisper positions to a variable short audio state."""
-
-    def __init__(
-        self, hidden_size: int = 1280, adapter_size: int = 128, frames: int = 1500
-    ):
-        super().__init__()
-        self.frames = frames
-        self.input_norm = nn.LayerNorm(hidden_size)
-        self.key_value = nn.Linear(hidden_size, adapter_size * 2, bias=False)
-        self.queries = nn.Parameter(torch.empty(frames, adapter_size))
-        self.attention = nn.MultiheadAttention(
-            adapter_size, num_heads=4, batch_first=True
-        )
-        self.output = nn.Sequential(
-            nn.LayerNorm(adapter_size),
-            nn.Linear(adapter_size, hidden_size, bias=False),
-        )
-        self.position_bias = nn.Parameter(torch.zeros(frames, hidden_size))
-        nn.init.normal_(self.queries, std=0.02)
-
-    def forward(
-        self,
-        source: torch.Tensor,
-        source_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        projected = self.key_value(self.input_norm(source))
-        keys, values = projected.chunk(2, dim=-1)
-        queries = self.queries.unsqueeze(0).expand(source.shape[0], -1, -1)
-        attended, _ = self.attention(
-            queries,
-            keys,
-            values,
-            key_padding_mask=None if source_mask is None else ~source_mask.bool(),
-            need_weights=False,
-        )
-        output = self.output(attended) + self.position_bias
-        residual_frames = min(source.shape[1], self.frames)
-        residual = source[:, :residual_frames]
-        if source_mask is not None:
-            residual = residual * source_mask[:, :residual_frames, None]
-        output[:, :residual_frames] += residual
-        return output
 
 
 def main() -> None:
@@ -305,9 +259,10 @@ def _load_prefixed_weights(
     device: torch.device,
 ) -> None:
     state = module.state_dict()
-    with torch.no_grad(), safe_open(
-        weights_path, framework="pt", device="cpu"
-    ) as weights:
+    with (
+        torch.no_grad(),
+        safe_open(weights_path, framework="pt", device="cpu") as weights,
+    ):
         available = set(weights.keys())
         for name, destination in state.items():
             key = prefix + name
